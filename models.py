@@ -154,7 +154,7 @@ def run_moirai2(
     inputs: List[np.ndarray],
     horizon: int,
     context_length: int,
-    device: str = "cpu",
+    device: str = "cuda",
     batch_size: int = 32,
 ) -> Dict[str, Any]:
     try:

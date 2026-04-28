@@ -76,7 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--moirai2-device",
         type=str,
-        default="cpu",
+        default="cuda",
         help="Torch device for Moirai 2.0. CPU is the default because GluonTS can emit float64 tensors that MPS rejects.",
     )
     parser.add_argument(
