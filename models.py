@@ -9,6 +9,8 @@ MOIRAI2_MODEL_ID = "Salesforce/moirai-2.0-R-small"
 MOIRAI2_MODEL_NAME = "Moirai 2.0"
 
 def resolve_torch_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
     if torch.backends.mps.is_available():
         return "mps"
     return "cpu"
