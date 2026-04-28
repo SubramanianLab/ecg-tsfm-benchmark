@@ -76,14 +76,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--moirai2-device",
         type=str,
-        default="cuda",
-        help="Torch device for Moirai 2.0. CPU is the default because GluonTS can emit float64 tensors that MPS rejects.",
+        default="cpu",
+        help="Torch device for Moirai 2.0. CPU is the default; use cuda explicitly with a small --moirai2-batch-size.",
     )
     parser.add_argument(
         "--moirai2-batch-size",
         type=int,
         default=32,
-        help="Batch size for Moirai 2.0 inference.",
+        help="Batch size for Moirai 2.0 inference. For CUDA, 1 or 2 is safer with long ECG contexts.",
     )
     parser.add_argument("--normalize", action="store_true", help="Z-score normalize each selected lead")
     parser.add_argument(

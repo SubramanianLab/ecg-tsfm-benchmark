@@ -25,6 +25,11 @@ def _forecast_with_model(
     if model_name == "moirai2":
         return run_moirai2(inputs, horizon, context_length, device=moirai2_device, batch_size=moirai2_batch_size)
     raise ValueError(f"Unsupported model: {model_name}")
+
+def _append_optional_forecast_slice(items: List[np.ndarray], result: Dict[str, Any], key: str, index: int) -> None:
+    if key in result and result[key] is not None:
+        items.append(np.asarray(result[key][index]))
+
 def forecast_records(
     records: List[Dict[str, Any]],
     horizon: int,
@@ -78,19 +83,28 @@ def forecast_records(
         num_record_leads = len(record["lead_names"])
         point_all = []
         rr_point_all = []
+        quantile_all = []
+        rr_quantile_all = []
         for lead_index in range(num_record_leads):
             point_all.append(waveform_result["point"][cursor + lead_index])
             rr_point_all.append(rr_result["point"][cursor + lead_index])
-        grouped_results.append(
-            {
-                "record_id": record["record_id"],
-                "lead_names": record["lead_names"],
-                "name": waveform_result["name"],
-                "color": waveform_result["color"],
-                "point": np.stack(point_all, axis=0),
-                "rr_point": np.stack(rr_point_all, axis=0),
-            }
-        )
+            _append_optional_forecast_slice(quantile_all, waveform_result, "quantiles", cursor + lead_index)
+            _append_optional_forecast_slice(rr_quantile_all, rr_result, "quantiles", cursor + lead_index)
+        grouped_result = {
+            "record_id": record["record_id"],
+            "lead_names": record["lead_names"],
+            "name": waveform_result["name"],
+            "color": waveform_result["color"],
+            "point": np.stack(point_all, axis=0),
+            "rr_point": np.stack(rr_point_all, axis=0),
+        }
+        if quantile_all:
+            grouped_result["quantiles"] = np.stack(quantile_all, axis=0)
+            grouped_result["quantile_levels"] = np.asarray(waveform_result["quantile_levels"], dtype=np.float32)
+        if rr_quantile_all:
+            grouped_result["rr_quantiles"] = np.stack(rr_quantile_all, axis=0)
+            grouped_result["rr_quantile_levels"] = np.asarray(rr_result["quantile_levels"], dtype=np.float32)
+        grouped_results.append(grouped_result)
         cursor += num_record_leads
     return grouped_results
 

@@ -184,6 +184,13 @@ def _metric_cache_key(model_name: str, context_length: int, horizon: int, rr_con
     )
 
 
+def _metric_row_has_ks(row: Dict[str, Any]) -> bool:
+    return not (
+        is_missing_value(row.get("rr_ks_mean"))
+        or is_missing_value(row.get("waveform_rr_ks_mean"))
+    )
+
+
 def _sort_metric_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
     model_order = {name: index for index, name in enumerate(MODEL_NAMES.values())}
     return sorted(
@@ -394,6 +401,63 @@ def direct_rr_pairs(
     return pairs
 
 
+
+def direct_rr_pit_pairs(
+    records: Sequence[Dict[str, Any]],
+    results: Sequence[Dict[str, Any]],
+    context_length: int,
+    rr_horizon: int,
+) -> List[tuple[np.ndarray, np.ndarray]]:
+    """Return (truth, z) pairs for direct RR PIT/time-rescaling KS.
+
+    z must be F(true_rr_i | history). forecast_records must provide one of:
+    rr_pit/rr_cdf/rr_z, rr_samples, or rr_quantiles plus quantile levels. If
+    only rr_point exists, this returns no pairs and KS remains NA.
+    """
+    pairs: List[tuple[np.ndarray, np.ndarray]] = []
+    for record, result in zip(records, results):
+        truth = future_rr_from_annotations(record, context_length, rr_horizon)
+        for lead_index in range(len(record["lead_names"])):
+            pit = _pit_values_from_result(result, lead_index, truth, prefix="rr")
+            limit = min(len(truth), len(pit))
+            if limit:
+                pairs.append((truth[:limit], pit[:limit]))
+    return pairs
+
+
+def waveform_rr_pit_pairs(
+    records: Sequence[Dict[str, Any]],
+    results: Sequence[Dict[str, Any]],
+    context_length: int,
+    horizon: int,
+) -> List[tuple[np.ndarray, np.ndarray]]:
+    """Return (truth, z) pairs for waveform-derived RR PIT/time-rescaling KS.
+
+    This requires forecast_records to provide waveform_rr_pit/waveform_rr_cdf/
+    waveform_rr_z, waveform_rr_samples, or waveform_rr_quantiles. Extracting a
+    single RR sequence from a point waveform forecast is not enough to compute
+    a time-rescaling KS statistic.
+    """
+    pairs: List[tuple[np.ndarray, np.ndarray]] = []
+    for record, result in zip(records, results):
+        truth = future_rr_for_waveform_window(record, context_length, horizon)
+        sampling_rate = float(record["sampling_rate"])
+        for lead_index in range(len(record["lead_names"])):
+            pit = _pit_values_from_result(result, lead_index, truth, prefix="waveform_rr")
+            if pit.size == 0:
+                pit = _waveform_rr_pit_from_waveform_quantiles(
+                    record,
+                    result,
+                    lead_index,
+                    truth,
+                    context_length=context_length,
+                    sampling_rate=sampling_rate,
+                )
+            limit = min(len(truth), len(pit))
+            if limit:
+                pairs.append((truth[:limit], pit[:limit]))
+    return pairs
+
 def waveform_forecast_pairs(
     records: Sequence[Dict[str, Any]],
     results: Sequence[Dict[str, Any]],
@@ -411,11 +475,228 @@ def waveform_forecast_pairs(
     return pairs
 
 
-def aggregate_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> Dict[str, Any]:
+def _empty_metric_dict() -> Dict[str, Any]:
+    return {
+        "rmse": math.nan,
+        "mae": math.nan,
+        "window_rmse_mean": math.nan,
+        "window_mae_mean": math.nan,
+        "ks_mean": math.nan,
+        "ks_cutoff_mean": math.nan,
+        "ks_pass_rate": math.nan,
+    }
+
+
+def pit_ks_from_cdf_values(cdf_values: np.ndarray) -> Dict[str, float]:
+    """One-sample KS statistic against Uniform(0, 1) for PIT/time-rescaled values.
+
+    Each value should be z_i = F(tau_i | H_{i-1}), where tau_i is the observed
+    RR interval and F is the model's conditional CDF for that interval.
+    """
+    z = np.asarray(cdf_values, dtype=np.float64).reshape(-1)
+    z = z[np.isfinite(z)]
+    if z.size == 0:
+        return {"ks": math.nan, "ks_cutoff": math.nan, "ks_pass": math.nan}
+
+    z = np.clip(z, 1e-7, 1.0 - 1e-7)
+    z_sorted = np.sort(z)
+    n = int(z_sorted.size)
+    reference = (np.arange(1, n + 1, dtype=np.float64) - 0.5) / n
+    ks = float(np.max(np.abs(reference - z_sorted)))
+    cutoff = float(1.36 / np.sqrt(n))
+    return {"ks": ks, "ks_cutoff": cutoff, "ks_pass": float(ks <= cutoff)}
+
+
+def empirical_cdf_values_from_samples(samples: np.ndarray, observed: np.ndarray) -> np.ndarray:
+    """Estimate F(observed_i | H_{i-1}) from forecast samples.
+
+    Accepted sample shapes are (num_samples, horizon) or (horizon, num_samples).
+    The returned array has length min(horizon, len(observed)).
+    """
+    x = np.asarray(samples, dtype=np.float64)
+    y = np.asarray(observed, dtype=np.float64).reshape(-1)
+    if x.ndim != 2 or y.size == 0:
+        return np.array([], dtype=np.float64)
+
+    if x.shape[0] == y.size and x.shape[1] != y.size:
+        sample_matrix = x.T
+    else:
+        sample_matrix = x
+
+    horizon = min(sample_matrix.shape[1], y.size)
+    sample_matrix = sample_matrix[:, :horizon]
+    y = y[:horizon]
+    return np.mean(sample_matrix <= y[None, :], axis=0)
+
+
+def empirical_cdf_values_from_quantiles(
+    quantiles: np.ndarray,
+    quantile_levels: np.ndarray,
+    observed: np.ndarray,
+) -> np.ndarray:
+    """Approximate F(observed_i | H_{i-1}) by interpolating model quantiles."""
+    q = np.asarray(quantiles, dtype=np.float64)
+    levels = np.asarray(quantile_levels, dtype=np.float64).reshape(-1)
+    y = np.asarray(observed, dtype=np.float64).reshape(-1)
+    if q.ndim != 2 or levels.size == 0 or y.size == 0:
+        return np.array([], dtype=np.float64)
+
+    if q.shape[1] == levels.size:
+        q_by_horizon = q
+    elif q.shape[0] == levels.size:
+        q_by_horizon = q.T
+    else:
+        return np.array([], dtype=np.float64)
+
+    order = np.argsort(levels)
+    levels = levels[order]
+    q_by_horizon = q_by_horizon[:, order]
+
+    horizon = min(q_by_horizon.shape[0], y.size)
+    z = []
+    for i in range(horizon):
+        qi = q_by_horizon[i]
+        finite = np.isfinite(qi) & np.isfinite(levels)
+        if finite.sum() < 2:
+            z.append(math.nan)
+            continue
+        value_order = np.argsort(qi[finite])
+        z.append(
+            float(
+                np.interp(
+                    y[i],
+                    qi[finite][value_order],
+                    levels[finite][value_order],
+                    left=0.0,
+                    right=1.0,
+                )
+            )
+        )
+    return np.asarray(z, dtype=np.float64)
+
+
+def _waveform_rr_pit_from_waveform_quantiles(
+    record: Dict[str, Any],
+    result: Dict[str, Any],
+    lead_index: int,
+    truth: np.ndarray,
+    *,
+    context_length: int,
+    sampling_rate: float,
+) -> np.ndarray:
+    quantiles = _first_present(result, ["quantiles", "forecast_quantiles"])
+    levels = _first_present(result, ["quantile_levels", "quantile_probs"])
+    if quantiles is None or levels is None:
+        return np.array([], dtype=np.float64)
+
+    waveform_quantiles = _lead_array(quantiles, lead_index)
+    quantile_levels = np.asarray(levels, dtype=np.float64).reshape(-1)
+    if waveform_quantiles.ndim != 2 or quantile_levels.size == 0:
+        return np.array([], dtype=np.float64)
+
+    if waveform_quantiles.shape[-1] == quantile_levels.size:
+        waveform_by_quantile = np.moveaxis(waveform_quantiles, -1, 0)
+    elif waveform_quantiles.shape[0] == quantile_levels.size:
+        waveform_by_quantile = waveform_quantiles
+    else:
+        return np.array([], dtype=np.float64)
+
+    max_rr = len(truth)
+    if max_rr == 0:
+        return np.array([], dtype=np.float64)
+
+    rr_quantiles = np.full((max_rr, len(quantile_levels)), np.nan, dtype=np.float64)
+    context_signal = record["signals"][lead_index, :context_length]
+    for quantile_index, predicted_signal in enumerate(waveform_by_quantile):
+        rr = extract_rr_from_waveform(
+            context_signal,
+            predicted_signal,
+            sampling_rate=sampling_rate,
+        )
+        limit = min(max_rr, len(rr))
+        if limit:
+            rr_quantiles[:limit, quantile_index] = rr[:limit]
+
+    return empirical_cdf_values_from_quantiles(rr_quantiles, quantile_levels, truth)
+
+
+def _lead_array(value: Any, lead_index: int) -> np.ndarray:
+    arr = np.asarray(value)
+    if arr.ndim >= 2 and arr.shape[0] > lead_index:
+        return np.asarray(arr[lead_index])
+    return arr
+
+
+def _first_present(result: Dict[str, Any], keys: Sequence[str]) -> Any:
+    for key in keys:
+        if key in result and result[key] is not None:
+            return result[key]
+    return None
+
+
+def _pit_values_from_result(
+    result: Dict[str, Any],
+    lead_index: int,
+    truth: np.ndarray,
+    *,
+    prefix: str,
+) -> np.ndarray:
+    """Extract or derive PIT values from a forecast result dictionary.
+
+    Returns an empty array when only point forecasts are available. A true
+    time-rescaling/PIT KS statistic requires a conditional predictive
+    distribution, not just a point estimate.
+    """
+    direct = _first_present(
+        result,
+        [
+            f"{prefix}_pit",
+            f"{prefix}_pits",
+            f"{prefix}_z",
+            f"{prefix}_cdf",
+            f"{prefix}_cdf_values",
+        ],
+    )
+    if direct is not None:
+        return _lead_array(direct, lead_index).astype(np.float64).reshape(-1)
+
+    samples = _first_present(
+        result,
+        [
+            f"{prefix}_samples",
+            f"{prefix}_sample",
+            f"{prefix}_forecast_samples",
+        ],
+    )
+    if samples is not None:
+        return empirical_cdf_values_from_samples(_lead_array(samples, lead_index), truth)
+
+    quantiles = _first_present(
+        result,
+        [
+            f"{prefix}_quantiles",
+            f"{prefix}_forecast_quantiles",
+        ],
+    )
+    levels = _first_present(
+        result,
+        [
+            f"{prefix}_quantile_levels",
+            f"{prefix}_quantile_probs",
+            "quantile_levels",
+            "quantile_probs",
+        ],
+    )
+    if quantiles is not None and levels is not None:
+        return empirical_cdf_values_from_quantiles(_lead_array(quantiles, lead_index), levels, truth)
+
+    return np.array([], dtype=np.float64)
+
+
+def aggregate_point_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> Dict[str, Any]:
     errors = []
     window_rmse = []
     window_mae = []
-    ks_values = []
     for truth, pred in pairs:
         limit = min(len(truth), len(pred))
         if limit == 0:
@@ -426,29 +707,57 @@ def aggregate_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> Dict[st
         errors.append(diff)
         window_rmse.append(float(np.sqrt(np.mean(diff**2))))
         window_mae.append(float(np.mean(np.abs(diff))))
-        try:
-            from scipy.stats import ks_2samp
 
-            ks_values.append(float(ks_2samp(truth_limited, pred_limited).statistic))
-        except Exception:
-            pass
+    output = _empty_metric_dict()
     if not errors:
-        return {
-            "rmse": math.nan,
-            "mae": math.nan,
-            "window_rmse_mean": math.nan,
-            "window_mae_mean": math.nan,
-            "ks_mean": math.nan,
-        }
-    all_errors = np.concatenate(errors)
-    return {
-        "rmse": float(np.sqrt(np.mean(all_errors**2))),
-        "mae": float(np.mean(np.abs(all_errors))),
-        "window_rmse_mean": float(np.mean(window_rmse)),
-        "window_mae_mean": float(np.mean(window_mae)),
-        "ks_mean": float(np.mean(ks_values)) if ks_values else math.nan,
-    }
+        return output
 
+    all_errors = np.concatenate(errors)
+    output.update(
+        {
+            "rmse": float(np.sqrt(np.mean(all_errors**2))),
+            "mae": float(np.mean(np.abs(all_errors))),
+            "window_rmse_mean": float(np.mean(window_rmse)),
+            "window_mae_mean": float(np.mean(window_mae)),
+        }
+    )
+    return output
+
+
+def aggregate_pit_ks(pit_pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> Dict[str, Any]:
+    """Aggregate one-sample PIT KS scores across windows/leads."""
+    ks_values = []
+    cutoffs = []
+    passes = []
+    for _truth, pit_values in pit_pairs:
+        result = pit_ks_from_cdf_values(pit_values)
+        if not math.isnan(result["ks"]):
+            ks_values.append(result["ks"])
+            cutoffs.append(result["ks_cutoff"])
+            passes.append(result["ks_pass"])
+
+    output = _empty_metric_dict()
+    output.update(
+        {
+            "ks_mean": float(np.mean(ks_values)) if ks_values else math.nan,
+            "ks_cutoff_mean": float(np.mean(cutoffs)) if cutoffs else math.nan,
+            "ks_pass_rate": float(np.mean(passes)) if passes else math.nan,
+        }
+    )
+    return output
+
+
+def merge_distribution_metrics(point_metrics: Dict[str, Any], ks_metrics: Dict[str, Any]) -> Dict[str, Any]:
+    output = dict(point_metrics)
+    output["ks_mean"] = ks_metrics.get("ks_mean", math.nan)
+    output["ks_cutoff_mean"] = ks_metrics.get("ks_cutoff_mean", math.nan)
+    output["ks_pass_rate"] = ks_metrics.get("ks_pass_rate", math.nan)
+    return output
+
+
+# Backward-compatible alias. This no longer computes two-sample KS.
+def aggregate_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> Dict[str, Any]:
+    return aggregate_point_metrics(pairs)
 
 def step_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]], horizon: int) -> List[Dict[str, Any]]:
     rows = []
@@ -502,15 +811,15 @@ def metric_row(
         "rr_window_rmse_mean": direct_rr_metrics["window_rmse_mean"],
         "rr_window_mae_mean": direct_rr_metrics["window_mae_mean"],
         "rr_ks_mean": direct_rr_metrics["ks_mean"],
-        "rr_ks_cutoff_mean": math.nan,
-        "rr_ks_pass_rate": math.nan,
+        "rr_ks_cutoff_mean": direct_rr_metrics.get("ks_cutoff_mean", math.nan),
+        "rr_ks_pass_rate": direct_rr_metrics.get("ks_pass_rate", math.nan),
         "waveform_rr_rmse": extracted_rr_metrics["rmse"],
         "waveform_rr_mae": extracted_rr_metrics["mae"],
         "waveform_rr_window_rmse_mean": extracted_rr_metrics["window_rmse_mean"],
         "waveform_rr_window_mae_mean": extracted_rr_metrics["window_mae_mean"],
         "waveform_rr_ks_mean": extracted_rr_metrics["ks_mean"],
-        "waveform_rr_ks_cutoff_mean": math.nan,
-        "waveform_rr_ks_pass_rate": math.nan,
+        "waveform_rr_ks_cutoff_mean": extracted_rr_metrics.get("ks_cutoff_mean", math.nan),
+        "waveform_rr_ks_pass_rate": extracted_rr_metrics.get("ks_pass_rate", math.nan),
     }
 
 
@@ -557,7 +866,11 @@ def generate_paper_metrics(
             for context_length in contexts:
                 current_rr_context = int(context_length) if rr_context is None else int(rr_context)
                 current_rr_horizon = int(horizon) if rr_horizon is None else int(rr_horizon)
-                cached_keys = {_row_key(row, METRIC_KEY_FIELDS) for row in subject_metric_rows}
+                cached_keys = {
+                    _row_key(row, METRIC_KEY_FIELDS)
+                    for row in subject_metric_rows
+                    if _metric_row_has_ks(row)
+                }
                 for model_key in model_keys:
                     model_name = MODEL_NAMES[model_key]
                     key = _metric_cache_key(
@@ -617,14 +930,36 @@ def generate_paper_metrics(
                     moirai2_device=moirai2_device,
                     moirai2_batch_size=moirai2_batch_size,
                 )
-                waveform_metrics = aggregate_metrics(
+                waveform_metrics = aggregate_point_metrics(
                     waveform_forecast_pairs(base_records, results, context_length, current_horizon)
                 )
+
                 direct_pairs = direct_rr_pairs(base_records, results, context_length, current_rr_horizon)
-                direct_metrics = aggregate_metrics(direct_pairs)
-                extracted_metrics = aggregate_metrics(
-                    waveform_pairs(base_records, results, context_length, current_horizon)
+                direct_point_metrics = aggregate_point_metrics(direct_pairs)
+                direct_ks_metrics = aggregate_pit_ks(
+                    direct_rr_pit_pairs(base_records, results, context_length, current_rr_horizon)
                 )
+                direct_metrics = merge_distribution_metrics(direct_point_metrics, direct_ks_metrics)
+
+                extracted_pairs = waveform_pairs(base_records, results, context_length, current_horizon)
+                extracted_point_metrics = aggregate_point_metrics(extracted_pairs)
+                extracted_ks_metrics = aggregate_pit_ks(
+                    waveform_rr_pit_pairs(base_records, results, context_length, current_horizon)
+                )
+                extracted_metrics = merge_distribution_metrics(extracted_point_metrics, extracted_ks_metrics)
+                metric_key = _metric_cache_key(
+                    model_name,
+                    context_length,
+                    current_horizon,
+                    current_rr_context,
+                    current_rr_horizon,
+                )
+                subject_metric_rows = [
+                    row for row in subject_metric_rows if _row_key(row, METRIC_KEY_FIELDS) != metric_key
+                ]
+                subject_step_rows = [
+                    row for row in subject_step_rows if _row_key(row, METRIC_KEY_FIELDS) != metric_key
+                ]
                 subject_metric_rows.append(
                     {
                         "subject_id": subject_id,

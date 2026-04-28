@@ -1,4 +1,5 @@
 from __future__ import annotations
+import gc
 import inspect
 from typing import Any, Dict, List
 import numpy as np
@@ -7,6 +8,8 @@ import torch
 _MOIRAI2_MODULE = None
 MOIRAI2_MODEL_ID = "Salesforce/moirai-2.0-R-small"
 MOIRAI2_MODEL_NAME = "Moirai 2.0"
+QUANTILE_LEVELS = np.asarray([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9], dtype=np.float32)
+QUANTILE_LEVEL_LIST = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 
 def resolve_torch_device() -> str:
     if torch.cuda.is_available():
@@ -80,16 +83,19 @@ def run_timesfm(inputs: List[np.ndarray], horizon: int, context_length: int) -> 
             max_context=context_length,
             max_horizon=horizon,
             normalize_inputs=True,
-            use_continuous_quantile_head=False,
+            use_continuous_quantile_head=horizon <= 1024,
             force_flip_invariance=True,
             infer_is_positive=False,
-            fix_quantile_crossing=False,
+            fix_quantile_crossing=True,
         )
     )
     prepared_inputs = [_fixed_length_context(signal, context_length) for signal in inputs]
     print(f"[TimesFM] Forecasting {horizon} samples...")
-    point_forecast, _ = model.forecast(horizon=horizon, inputs=prepared_inputs)
+    point_forecast, quantile_forecast = model.forecast(horizon=horizon, inputs=prepared_inputs)
     point_forecast = np.asarray(point_forecast, dtype=np.float32)
+    quantile_forecast = np.asarray(quantile_forecast, dtype=np.float32)
+    if quantile_forecast.ndim == 3 and quantile_forecast.shape[-1] == len(QUANTILE_LEVELS) + 1:
+        quantile_forecast = quantile_forecast[..., 1:]
     if not np.isfinite(point_forecast).all():
         bad_count = int(point_forecast.size - np.isfinite(point_forecast).sum())
         raise RuntimeError(
@@ -100,6 +106,8 @@ def run_timesfm(inputs: List[np.ndarray], horizon: int, context_length: int) -> 
         "name": "TimesFM",
         "color": "royalblue",
         "point": point_forecast,
+        "quantiles": quantile_forecast,
+        "quantile_levels": QUANTILE_LEVELS.copy(),
     }
 
 def run_chronos(inputs: List[np.ndarray], horizon: int, context_length: int) -> Dict[str, Any]:
@@ -122,19 +130,23 @@ def run_chronos(inputs: List[np.ndarray], horizon: int, context_length: int) -> 
         batch.append(trimmed.reshape(1, -1))
     batch_np = np.stack(batch, axis=0)
     print(f"[Chronos-2] Forecasting {horizon} samples, input shape={batch_np.shape}...")
-    _, mean = pipeline.predict_quantiles(
+    quantiles, mean = pipeline.predict_quantiles(
         batch_np,
         prediction_length=horizon,
-        quantile_levels=[0.1, 0.5, 0.9],
+        quantile_levels=QUANTILE_LEVEL_LIST,
     )
     n_leads = len(inputs)
     point_all = np.zeros((n_leads, horizon), dtype=np.float32)
+    quantile_all = np.zeros((n_leads, horizon, len(QUANTILE_LEVELS)), dtype=np.float32)
     for index in range(n_leads):
         point_all[index] = mean[index].squeeze(0).cpu().numpy()[:horizon]
+        quantile_all[index] = quantiles[index].squeeze(0).cpu().numpy()[:horizon]
     return {
         "name": "Chronos-2",
         "color": "crimson",
         "point": point_all,
+        "quantiles": quantile_all,
+        "quantile_levels": QUANTILE_LEVELS.copy(),
     }
 
 def load_moirai2_module():
@@ -150,11 +162,16 @@ def load_moirai2_module():
             _MOIRAI2_MODULE = Moirai2Module.from_pretrained(MOIRAI2_MODEL_ID)
     return _MOIRAI2_MODULE
 
+def _release_cuda_cache() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
 def run_moirai2(
     inputs: List[np.ndarray],
     horizon: int,
     context_length: int,
-    device: str = "cuda",
+    device: str = "cpu",
     batch_size: int = 32,
 ) -> Dict[str, Any]:
     try:
@@ -169,9 +186,29 @@ def run_moirai2(
 
     if device == "mps" and not torch.backends.mps.is_available():
         raise RuntimeError("Requested MPS for Moirai2, but torch.backends.mps.is_available() is false.")
-    print(f"\n[{MOIRAI2_MODEL_NAME}] Loading model (device={device})...")
+    if device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("Requested CUDA for Moirai2, but torch.cuda.is_available() is false.")
+    _release_cuda_cache()
+    module = load_moirai2_module()
+    patch_size = int(getattr(module, "patch_size", 1))
+    context_tokens = int(np.ceil(context_length / patch_size))
+    horizon_tokens = int(np.ceil(horizon / patch_size))
+    num_predict_token = int(getattr(module, "num_predict_token", 1))
+    num_quantiles = int(getattr(module, "num_quantiles", 1))
+    recursive_steps = max(0, int(np.ceil(max(0, horizon_tokens - num_predict_token) / num_predict_token)))
+    print(
+        f"\n[{MOIRAI2_MODEL_NAME}] Loading model "
+        f"(device={device}, batch_size={batch_size}, patch_size={patch_size}, "
+        f"context_tokens={context_tokens}, horizon_tokens={horizon_tokens}, "
+        f"num_quantiles={num_quantiles}, recursive_steps={recursive_steps})..."
+    )
+    if device == "cuda" and batch_size > 4:
+        print(
+            f"[{MOIRAI2_MODEL_NAME}] Warning: CUDA batch_size={batch_size} can use a lot of memory "
+            "for long ECG contexts. If this OOMs, retry with --moirai2-batch-size 1 or 2."
+        )
     model = Moirai2Forecast(
-        module=load_moirai2_module(),
+        module=module,
         prediction_length=horizon,
         context_length=context_length,
         target_dim=1,
@@ -199,14 +236,21 @@ def run_moirai2(
     print(f"[{MOIRAI2_MODEL_NAME}] Forecasting {horizon} samples...")
     forecasts = list(predictor.predict(dataset))
     point_all = np.zeros((len(inputs), horizon), dtype=np.float32)
+    quantile_levels = np.asarray(getattr(module, "quantile_levels", QUANTILE_LEVELS), dtype=np.float32)
+    quantile_all = np.zeros((len(inputs), horizon, len(quantile_levels)), dtype=np.float32)
     for index, forecast in enumerate(forecasts[: len(inputs)]):
         try:
             point = np.asarray(forecast.mean, dtype=np.float32)
         except Exception:
             point = np.asarray(forecast.quantile("0.5"), dtype=np.float32)
         point_all[index] = point.reshape(-1)[:horizon]
+        for quantile_index, level in enumerate(quantile_levels):
+            quantile = np.asarray(forecast.quantile(f"{float(level):.1f}"), dtype=np.float32).reshape(-1)
+            quantile_all[index, :, quantile_index] = quantile[:horizon]
     return {
         "name": MOIRAI2_MODEL_NAME,
         "color": "darkgreen",
         "point": point_all,
+        "quantiles": quantile_all,
+        "quantile_levels": quantile_levels.copy(),
     }
