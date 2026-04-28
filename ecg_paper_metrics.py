@@ -62,6 +62,49 @@ MODEL_NAMES = {
     "moirai2": "Moirai 2.0",
 }
 
+NSRDB_SUBJECT_IDS = (
+    "16265",
+    "16272",
+    "16273",
+    "16420",
+    "16483",
+    "16539",
+    "16773",
+    "16786",
+    "16795",
+    "17052",
+    "17453",
+    "18177",
+    "18184",
+    "19088",
+    "19090",
+    "19093",
+    "19140",
+    "19830",
+)
+
+SUBJECT_METRIC_FIELDNAMES = ["subject_id", *METRIC_FIELDNAMES]
+SUBJECT_STEP_FIELDNAMES = ["subject_id", *STEP_FIELDNAMES]
+
+METRIC_KEY_FIELDS = [
+    "model",
+    "context_length",
+    "horizon",
+    "rr_context_beats",
+    "rr_horizon_beats",
+]
+
+STEP_KEY_FIELDS = [
+    "model",
+    "context_length",
+    "horizon",
+    "rr_context_beats",
+    "rr_horizon_beats",
+    "step_index",
+]
+
+SUM_FIELDS = {"num_windows", "num_series", "count"}
+
 
 def is_missing_value(value: Any) -> bool:
     if value is None:
@@ -98,6 +141,118 @@ def merge_model_rows(path: Path, new_rows: Sequence[Dict[str, Any]], model_names
     excluded = set(model_names)
     kept = [row for row in old_rows if row.get("model") not in excluded]
     write_rows(path, [*kept, *new_rows], fieldnames)
+
+
+def resolve_subject_ids(record_ids: Sequence[str]) -> List[str]:
+    if len(record_ids) == 1 and record_ids[0].strip().lower() == "all":
+        return list(NSRDB_SUBJECT_IDS)
+    return [record_id.strip() for record_id in record_ids if record_id.strip()]
+
+
+def _cache_path(results_dir: Path, subject_id: str, suffix: str) -> Path:
+    safe_subject = subject_id.replace("/", "_")
+    return results_dir / f"subject_{safe_subject}_{suffix}.csv"
+
+
+def _as_int(value: Any) -> int:
+    return int(float(value))
+
+
+def _as_float(value: Any) -> float:
+    if is_missing_value(value):
+        return math.nan
+    return float(value)
+
+
+def _row_key(row: Dict[str, Any], fields: Sequence[str]) -> tuple[Any, ...]:
+    values = []
+    for field in fields:
+        if field == "model":
+            values.append(str(row[field]))
+        else:
+            values.append(_as_int(row[field]))
+    return tuple(values)
+
+
+def _metric_cache_key(model_name: str, context_length: int, horizon: int, rr_context: int, rr_horizon: int) -> tuple[Any, ...]:
+    return (
+        model_name,
+        int(context_length),
+        int(horizon),
+        int(rr_context),
+        int(rr_horizon),
+    )
+
+
+def _sort_metric_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    model_order = {name: index for index, name in enumerate(MODEL_NAMES.values())}
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("subject_id", "")),
+            _as_int(row["context_length"]),
+            _as_int(row["horizon"]),
+            model_order.get(str(row["model"]), 999),
+        ),
+    )
+
+
+def _sort_step_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    model_order = {name: index for index, name in enumerate(MODEL_NAMES.values())}
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("subject_id", "")),
+            _as_int(row["context_length"]),
+            _as_int(row["horizon"]),
+            model_order.get(str(row["model"]), 999),
+            _as_int(row["step_index"]),
+        ),
+    )
+
+
+def _average_subject_rows(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    key_fields: Sequence[str],
+    fieldnames: Sequence[str],
+) -> List[Dict[str, Any]]:
+    groups: Dict[tuple[Any, ...], List[Dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(_row_key(row, key_fields), []).append(row)
+
+    averaged_rows: List[Dict[str, Any]] = []
+    for key, group_rows in groups.items():
+        output: Dict[str, Any] = {"sweep_type": "waveform_context"}
+        for field, value in zip(key_fields, key):
+            output[field] = value
+        if "metric_type" in fieldnames:
+            output["metric_type"] = "rr"
+
+        for field in fieldnames:
+            if field in output or field in key_fields:
+                continue
+            if field in {"sweep_type", "metric_type"}:
+                continue
+            if field in SUM_FIELDS:
+                output[field] = int(sum(_as_int(row[field]) for row in group_rows if not is_missing_value(row.get(field))))
+                continue
+            values = [_as_float(row.get(field)) for row in group_rows]
+            finite_values = [value for value in values if not math.isnan(value)]
+            output[field] = float(np.mean(finite_values)) if finite_values else math.nan
+
+        averaged_rows.append(output)
+
+    model_order = {name: index for index, name in enumerate(MODEL_NAMES.values())}
+    return sorted(
+        averaged_rows,
+        key=lambda row: (
+            _as_int(row["context_length"]),
+            _as_int(row["horizon"]),
+            model_order.get(str(row["model"]), 999),
+            _as_int(row.get("step_index", 0)) if "step_index" in row else 0,
+        ),
+    )
 
 
 def build_evaluation_records(
@@ -363,7 +518,7 @@ def generate_paper_metrics(
     *,
     model_keys: Sequence[str],
     data_root: Path | None = None,
-    record_ids: Sequence[str] = ("16265",),
+    record_ids: Sequence[str] = ("all",),
     contexts: Sequence[int] = (2048, 4096, 8192),
     horizons: Sequence[int] = (256, 512, 1024),
     rr_context: int | None = None,
@@ -371,34 +526,91 @@ def generate_paper_metrics(
     max_windows: int = 32,
     metrics_path: Path = Path("figures/paper/rr_sweep.csv"),
     step_metrics_path: Path = Path("figures/paper/rr_sweep_step_metrics.csv"),
+    results_dir: Path = Path("figures/results"),
     moirai2_device: str = "cpu",
     moirai2_batch_size: int = 32,
 ) -> None:
     resolved_data_root = _resolve_default_data_root("nsrdb") if data_root is None else Path(data_root)
-    metrics_rows: List[Dict[str, Any]] = []
-    step_rows: List[Dict[str, Any]] = []
+    subject_ids = resolve_subject_ids(record_ids)
+    all_subject_metric_rows: List[Dict[str, Any]] = []
+    all_subject_step_rows: List[Dict[str, Any]] = []
     model_names = [MODEL_NAMES[key] for key in model_keys]
+    results_dir = Path(results_dir)
 
     max_context = max(int(value) for value in contexts)
-    for horizon in horizons:
-        base_records = build_evaluation_records(resolved_data_root, record_ids, max_context, int(horizon), max_windows)
-        if not base_records:
-            raise RuntimeError(f"No evaluation records were available for horizon={horizon}.")
+    print(f"Running paper metrics for {len(subject_ids)} subject(s): {', '.join(subject_ids)}")
+    print(f"Subject cache directory: {results_dir}")
 
-        for context_length in contexts:
-            current_rr_context = int(context_length) if rr_context is None else int(rr_context)
-            current_rr_horizon = int(horizon) if rr_horizon is None else int(rr_horizon)
-            for model_key in model_keys:
-                model_name = MODEL_NAMES[model_key]
+    for subject_index, subject_id in enumerate(subject_ids, start=1):
+        metric_cache_path = _cache_path(results_dir, subject_id, "rr_sweep")
+        step_cache_path = _cache_path(results_dir, subject_id, "rr_sweep_step_metrics")
+        subject_metric_rows: List[Dict[str, Any]] = list(read_rows(metric_cache_path))
+        subject_step_rows: List[Dict[str, Any]] = list(read_rows(step_cache_path))
+
+        print(
+            f"\nSubject {subject_index}/{len(subject_ids)}: {subject_id} "
+            f"({len(subject_metric_rows)} cached metric rows)"
+        )
+
+        for horizon in horizons:
+            missing_for_horizon = []
+            for context_length in contexts:
+                current_rr_context = int(context_length) if rr_context is None else int(rr_context)
+                current_rr_horizon = int(horizon) if rr_horizon is None else int(rr_horizon)
+                cached_keys = {_row_key(row, METRIC_KEY_FIELDS) for row in subject_metric_rows}
+                for model_key in model_keys:
+                    model_name = MODEL_NAMES[model_key]
+                    key = _metric_cache_key(
+                        model_name,
+                        int(context_length),
+                        int(horizon),
+                        current_rr_context,
+                        current_rr_horizon,
+                    )
+                    if key not in cached_keys:
+                        missing_for_horizon.append(
+                            (
+                                int(context_length),
+                                int(horizon),
+                                current_rr_context,
+                                current_rr_horizon,
+                                model_key,
+                                model_name,
+                            )
+                        )
+
+            if not missing_for_horizon:
+                print(f"  Horizon {horizon}: loaded from cache")
+                continue
+
+            base_records = build_evaluation_records(
+                resolved_data_root,
+                [subject_id],
+                max_context,
+                int(horizon),
+                max_windows,
+            )
+            if not base_records:
+                raise RuntimeError(f"No evaluation records were available for subject={subject_id}, horizon={horizon}.")
+
+            for (
+                context_length,
+                current_horizon,
+                current_rr_context,
+                current_rr_horizon,
+                model_key,
+                model_name,
+            ) in missing_for_horizon:
                 print(
-                    f"Running {model_name} metrics: context={context_length}, "
-                    f"horizon={horizon}, rr_context={current_rr_context}, "
-                    f"rr_horizon={current_rr_horizon}, windows={len(base_records)}"
+                    f"  Subject {subject_index}/{len(subject_ids)} {subject_id}: "
+                    f"{model_name}, context={context_length}, horizon={current_horizon}, "
+                    f"rr_context={current_rr_context}, rr_horizon={current_rr_horizon}, "
+                    f"windows={len(base_records)}"
                 )
                 results = forecast_records(
                     base_records,
-                    int(horizon),
-                    int(context_length),
+                    current_horizon,
+                    context_length,
                     current_rr_context,
                     current_rr_horizon,
                     model_key,
@@ -406,40 +618,91 @@ def generate_paper_metrics(
                     moirai2_batch_size=moirai2_batch_size,
                 )
                 waveform_metrics = aggregate_metrics(
-                    waveform_forecast_pairs(base_records, results, int(context_length), int(horizon))
+                    waveform_forecast_pairs(base_records, results, context_length, current_horizon)
                 )
-                direct_pairs = direct_rr_pairs(base_records, results, int(context_length), current_rr_horizon)
+                direct_pairs = direct_rr_pairs(base_records, results, context_length, current_rr_horizon)
                 direct_metrics = aggregate_metrics(direct_pairs)
                 extracted_metrics = aggregate_metrics(
-                    waveform_pairs(base_records, results, int(context_length), int(horizon))
+                    waveform_pairs(base_records, results, context_length, current_horizon)
                 )
-                metrics_rows.append(
-                    metric_row(
-                        model_name=model_name,
-                        context_length=int(context_length),
-                        horizon=int(horizon),
-                        rr_context=current_rr_context,
-                        rr_horizon=current_rr_horizon,
-                        records=base_records,
-                        waveform_metrics=waveform_metrics,
-                        direct_rr_metrics=direct_metrics,
-                        extracted_rr_metrics=extracted_metrics,
-                    )
+                subject_metric_rows.append(
+                    {
+                        "subject_id": subject_id,
+                        **metric_row(
+                            model_name=model_name,
+                            context_length=context_length,
+                            horizon=current_horizon,
+                            rr_context=current_rr_context,
+                            rr_horizon=current_rr_horizon,
+                            records=base_records,
+                            waveform_metrics=waveform_metrics,
+                            direct_rr_metrics=direct_metrics,
+                            extracted_rr_metrics=extracted_metrics,
+                        ),
+                    }
                 )
                 for step_row in step_metrics(direct_pairs, current_rr_horizon):
-                    step_rows.append(
+                    subject_step_rows.append(
                         {
+                            "subject_id": subject_id,
                             "sweep_type": "waveform_context",
                             "metric_type": "rr",
                             "model": model_name,
-                            "context_length": int(context_length),
-                            "horizon": int(horizon),
+                            "context_length": context_length,
+                            "horizon": current_horizon,
                             "rr_context_beats": int(current_rr_context),
                             "rr_horizon_beats": int(current_rr_horizon),
                             **step_row,
                         }
                     )
 
+                subject_metric_rows = _sort_metric_rows(subject_metric_rows)
+                subject_step_rows = _sort_step_rows(subject_step_rows)
+                write_rows(metric_cache_path, subject_metric_rows, SUBJECT_METRIC_FIELDNAMES)
+                write_rows(step_cache_path, subject_step_rows, SUBJECT_STEP_FIELDNAMES)
+                print(f"    Cached subject results to {metric_cache_path}")
+
+        all_subject_metric_rows.extend(subject_metric_rows)
+        all_subject_step_rows.extend(subject_step_rows)
+
+    expected_metric_keys = {
+        _metric_cache_key(
+            MODEL_NAMES[model_key],
+            int(context_length),
+            int(horizon),
+            int(context_length) if rr_context is None else int(rr_context),
+            int(horizon) if rr_horizon is None else int(rr_horizon),
+        )
+        for horizon in horizons
+        for context_length in contexts
+        for model_key in model_keys
+    }
+    selected_subject_metric_rows = [
+        row
+        for row in all_subject_metric_rows
+        if row.get("model") in set(model_names)
+        and _row_key(row, METRIC_KEY_FIELDS) in expected_metric_keys
+    ]
+    selected_subject_step_rows = [
+        row
+        for row in all_subject_step_rows
+        if row.get("model") in set(model_names)
+        and _row_key(row, METRIC_KEY_FIELDS) in expected_metric_keys
+    ]
+    metrics_rows = _average_subject_rows(
+        selected_subject_metric_rows,
+        key_fields=METRIC_KEY_FIELDS,
+        fieldnames=METRIC_FIELDNAMES,
+    )
+    step_rows = _average_subject_rows(
+        selected_subject_step_rows,
+        key_fields=STEP_KEY_FIELDS,
+        fieldnames=STEP_FIELDNAMES,
+    )
+
     merge_model_rows(metrics_path, metrics_rows, model_names, METRIC_FIELDNAMES)
     merge_model_rows(step_metrics_path, step_rows, model_names, STEP_FIELDNAMES)
-    print(f"Merged {', '.join(model_names)} rows into {metrics_path} and {step_metrics_path}")
+    print(
+        f"Averaged {len(subject_ids)} subject cache(s) into {metrics_path} "
+        f"and {step_metrics_path}"
+    )

@@ -39,6 +39,8 @@ The loaders expect MIT-BIH records in WFDB format. By default, dataset roots are
 - Arrhythmia database: `../mit-bih-arrhythmia-database-1.0.0`
 - Normal sinus rhythm database: `../mit-bih-normal-sinus-rhythm-database-1.0.0`
 
+If those paths are not present, the code also checks the archived layout under `../Archive/`.
+
 You can override these locations with `--data-root`.
 
 Examples:
@@ -98,16 +100,18 @@ Generate the RR metric sweep used for the manuscript:
 ```bash
 python generate_paper_metrics.py \
   --models all \
-  --records 16265 \
+  --records all \
   --contexts 2048,4096,8192 \
   --horizons 256,512,1024 \
   --max-windows 32
 ```
 
-By default, this writes:
+By default, this evaluates the 18-subject MIT-BIH NSRDB cohort, caches per-subject results under `figures/results/`, and writes subject-averaged outputs to:
 
 - `figures/paper/rr_sweep.csv`
 - `figures/paper/rr_sweep_step_metrics.csv`
+
+Each subject cache is written incrementally after a model/context/horizon combination completes. If a run is interrupted, rerunning the same command reuses matching cached rows and computes only missing combinations.
 
 You can run a subset of models while preserving existing rows for other models:
 

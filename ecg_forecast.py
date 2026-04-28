@@ -194,6 +194,8 @@ def run_cli(args: argparse.Namespace) -> None:
     else:
         args.output = str(_resolve_output_path(args.output))
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    from ecg_dataloader import list_mitbih_records
+
     if args.list_records:
         for record_id in list_mitbih_records(args.data_root):
             print(record_id)
@@ -232,7 +234,6 @@ def run_cli(args: argparse.Namespace) -> None:
             sampling_rate_hz=args.paper_table_sampling_rate,
         )
         return
-    from ecg_dataloader import list_mitbih_records
     from ecg_plots import plot_forecasts, plot_publication_rr_forecasts
     from ecg_workflows import forecast_records, prepare_forecast_window
 

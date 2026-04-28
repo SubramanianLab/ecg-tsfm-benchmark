@@ -17,7 +17,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="all",
         help="Comma-separated model keys to run: timesfm, chronos, moirai2, or all.",
     )
-    parser.add_argument("--records", type=str, default="16265", help="Comma-separated MIT-BIH NSRDB record ids.")
+    parser.add_argument(
+        "--records",
+        type=str,
+        default="all",
+        help="Comma-separated MIT-BIH NSRDB record ids, or all for the 18-subject NSRDB cohort.",
+    )
     parser.add_argument("--contexts", type=str, default="2048,4096,8192", help="Comma-separated waveform contexts.")
     parser.add_argument("--horizons", type=str, default="256,512,1024", help="Comma-separated waveform horizons.")
     parser.add_argument(
@@ -39,6 +44,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--step-metrics-output",
         type=Path,
         default=Path("figures/paper/rr_sweep_step_metrics.csv"),
+    )
+    parser.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("figures/results"),
+        help="Directory for per-subject cached metric CSVs used to resume interrupted runs.",
     )
     parser.add_argument(
         "--moirai2-device",
@@ -74,6 +85,7 @@ def main() -> None:
         max_windows=args.max_windows,
         metrics_path=args.metrics_output,
         step_metrics_path=args.step_metrics_output,
+        results_dir=args.results_dir,
         moirai2_device=args.moirai2_device,
         moirai2_batch_size=args.moirai2_batch_size,
     )

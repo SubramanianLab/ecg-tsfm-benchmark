@@ -15,7 +15,13 @@ MIN_RR_CONTEXT_BEATS = 512
 DEFAULT_RR_CONTEXT_BEATS = 2000
 
 def _resolve_default_data_root(dataset: str) -> Path:
-    return ROOT_DIR / DATASET_ROOTS[dataset]
+    direct_path = ROOT_DIR / DATASET_ROOTS[dataset]
+    if direct_path.exists():
+        return direct_path
+    archive_path = ROOT_DIR / "Archive" / DATASET_ROOTS[dataset]
+    if archive_path.exists():
+        return archive_path
+    return direct_path
 
 
 def _resolve_output_path(path_str: str) -> Path:

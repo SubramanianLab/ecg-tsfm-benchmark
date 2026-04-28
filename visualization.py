@@ -245,27 +245,45 @@ def write_publication_rr_table(
             [{key: _csv_value(value) for key, value in row.items()} for row in csv_rows]
         )
 
-    lines: List[str] = []
-    lines.append(r"\begin{table*}[t]")
-    lines.append(r"\centering")
-    lines.append(r"\caption{Forecasting performance across context lengths and prediction horizons.}")
-    lines.append(r"\label{tab:forecast_results}")
-    lines.append(r"\small")
-    lines.append(r"\setlength{\tabcolsep}{5pt}")
-    lines.append(r"\begin{tabular}{ll ll ccc}")
-    lines.append(r"\toprule")
-    lines.append(
+    caption = (
+        "Subject-averaged forecasting performance for RR interval prediction "
+        "across the 18-subject cohort, context lengths, and prediction horizons. Direct denotes direct RR "
+        "interval prediction; extracted denotes RR intervals derived from "
+        "model-predicted waveforms via peak extraction."
+    )
+    header = (
         r"Context Length & Prediction Horizon & Output Type & Model "
         r"& RMSE (s) $\downarrow$ & MAE (s) $\downarrow$ & KS $\downarrow$ \\"
     )
+
+    lines: List[str] = []
+    lines.append(r"\begin{longtable}{ll ll ccc}")
+    lines.append(rf"\caption{{{caption}}}")
+    lines.append(r"\label{tab:rr_results}\\")
+    lines.append("")
+    lines.append(r"\toprule")
+    lines.append(header)
     lines.append(r"\midrule")
+    lines.append(r"\endfirsthead")
+    lines.append("")
+    lines.append(rf"\caption[]{{{caption} \textit{{Continued.}}}}\\")
+    lines.append(r"\toprule")
+    lines.append(header)
+    lines.append(r"\midrule")
+    lines.append(r"\endhead")
+    lines.append("")
+    lines.append(r"\midrule")
+    lines.append(r"\multicolumn{7}{r}{\textit{Continued on next page}}\\")
+    lines.append(r"\endfoot")
+    lines.append("")
+    lines.append(r"\bottomrule")
+    lines.append(r"\endlastfoot")
     lines.append("")
 
     ordered_contexts = [int(value) for value in contexts]
     ordered_horizons = [int(value) for value in horizons]
     for context_index, context_length in enumerate(ordered_contexts):
         for horizon_index, horizon in enumerate(ordered_horizons):
-            group_rows: List[List[str]] = []
             for output_type in ("Direct", "Extracted"):
                 for model_name in MODEL_ORDER:
                     model_row = row_lookup.get((context_length, horizon, model_name), {})
@@ -277,25 +295,22 @@ def write_publication_rr_table(
                         rmse = _samples_to_seconds_or_none(model_row.get("waveform_rr_rmse"), sampling_rate_hz)
                         mae = _samples_to_seconds_or_none(model_row.get("waveform_rr_mae"), sampling_rate_hz)
                         ks = model_row.get("waveform_rr_ks_mean")
-                    group_rows.append(
-                        [
-                            "",
-                            "",
-                            "",
-                            model_name,
-                            _metric_or_dash(rmse),
-                            _metric_or_dash(mae),
-                            _metric_or_dash(ks),
-                        ]
+                    lines.append(
+                        " & ".join(
+                            [
+                                f"{context_length:,}",
+                                f"{horizon:,}",
+                                output_type,
+                                model_name,
+                                _metric_or_dash(rmse),
+                                _metric_or_dash(mae),
+                                _metric_or_dash(ks),
+                            ]
+                        )
+                        + r" \\"
                     )
-            group_rows[0][0] = rf"\multirow{{{len(group_rows)}}}{{*}}{{{context_length:,}}}"
-            group_rows[0][1] = rf"\multirow{{{len(group_rows)}}}{{*}}{{{horizon:,}}}"
-            group_rows[0][2] = rf"\multirow{{{len(MODEL_ORDER)}}}{{*}}{{Direct}}"
-            group_rows[len(MODEL_ORDER)][2] = rf"\multirow{{{len(MODEL_ORDER)}}}{{*}}{{Extracted}}"
-            for row_index, row_values in enumerate(group_rows):
-                if row_index == len(MODEL_ORDER):
+                if output_type == "Direct":
                     lines.append(r"\cmidrule(lr){3-7}")
-                lines.append(" & ".join(row_values) + r" \\")
             is_last_horizon = horizon_index == len(ordered_horizons) - 1
             if not is_last_horizon:
                 lines.append(r"\cmidrule(lr){1-7}")
@@ -305,10 +320,7 @@ def write_publication_rr_table(
             lines.append(r"\midrule")
             lines.append("")
 
-    lines.append(r"\bottomrule")
-    lines.append(r"\end{tabular}")
-    lines.append(r"\vskip -0.1in")
-    lines.append(r"\end{table*}")
+    lines.append(r"\end{longtable}")
     tex_output.write_text("\n".join(lines) + "\n")
     print(f"Saved publication table to {tex_output}")
     print(f"Saved publication table data to {csv_output}")
