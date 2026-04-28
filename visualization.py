@@ -22,12 +22,24 @@ _INT_FIELDS = {
 _FLOAT_FIELDS = {
     "rmse",
     "mae",
+    "true_sdnn",
+    "pred_sdnn",
+    "sdnn_ratio",
+    "sdnn_deficit",
+    "true_rmssd",
+    "pred_rmssd",
+    "rmssd_ratio",
+    "rmssd_deficit",
     "window_rmse_mean",
     "window_mae_mean",
     "rr_rmse",
     "rr_mae",
     "rr_window_rmse_mean",
     "rr_window_mae_mean",
+    "rr_true_local_std_mean",
+    "rr_pred_local_std_mean",
+    "rr_local_std_ratio",
+    "rr_local_std_deficit",
     "rr_ks_mean",
     "rr_ks_cutoff_mean",
     "rr_ks_pass_rate",
@@ -35,6 +47,10 @@ _FLOAT_FIELDS = {
     "waveform_rr_mae",
     "waveform_rr_window_rmse_mean",
     "waveform_rr_window_mae_mean",
+    "waveform_rr_true_local_std_mean",
+    "waveform_rr_pred_local_std_mean",
+    "waveform_rr_local_std_ratio",
+    "waveform_rr_local_std_deficit",
     "waveform_rr_ks_mean",
     "waveform_rr_ks_cutoff_mean",
     "waveform_rr_ks_pass_rate",
@@ -135,7 +151,27 @@ def plot_publication_rr_step_figure(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    metric_label = "RR Intervals" if metric_type.lower() == "rr" else metric_type
+    metric_label = {
+        "rr": "RR Intervals",
+        "rr_variability": "RR Variability",
+        "waveform_rr_variability": "Waveform-Derived RR Variability",
+    }.get(metric_type.lower(), metric_type)
+    if metric_type.lower() in {"rr_variability", "waveform_rr_variability"}:
+        metric_names = ("sdnn_ratio", "rmssd_ratio")
+        metric_titles = {
+            "sdnn_ratio": "Local SDNN ratio",
+            "rmssd_ratio": "Local RMSSD ratio",
+        }
+        ylabel = "Predicted / true"
+        transform_value = lambda value: float(value)
+    else:
+        metric_names = ("rmse", "mae")
+        metric_titles = {
+            "rmse": "RMSE",
+            "mae": "MAE",
+        }
+        ylabel = "RR interval error (s)"
+        transform_value = lambda value: float(value) / float(sampling_rate_hz)
     rows = load_evaluation_rows(step_csv_path)
     filtered = [
         row
@@ -160,7 +196,7 @@ def plot_publication_rr_step_figure(
         fig.suptitle(cohort_label, fontsize=13, y=0.995)
     for row_index, context_length in enumerate(ordered_contexts):
         context_rows = [row for row in filtered if int(row["context_length"]) == context_length]
-        for col_index, metric_name in enumerate(("rmse", "mae")):
+        for col_index, metric_name in enumerate(metric_names):
             axis = axes[row_index][col_index]
             for model_name in MODEL_ORDER:
                 model_rows = sorted(
@@ -172,15 +208,21 @@ def plot_publication_rr_step_figure(
                 axis.plot(
                     [int(row["step_index"]) for row in model_rows],
                     _rolling_median(
-                        [float(row[metric_name]) / float(sampling_rate_hz) for row in model_rows]
+                        [transform_value(row[metric_name]) for row in model_rows]
                     ),
                     linewidth=1.7,
                     color=MODEL_COLORS.get(model_name),
                     label=model_name,
                 )
-            axis.set_title(f"{metric_label} {metric_name.upper()} at context={context_length}")
+            if metric_type.lower() in {"rr_variability", "waveform_rr_variability"}:
+                axis.axhline(1.0, color="0.35", linewidth=1.0, linestyle="--", alpha=0.75)
+                axis.set_ylim(bottom=0)
+            title = metric_titles[metric_name]
+            if len(ordered_contexts) > 1:
+                title = f"{title} at context={context_length}"
+            axis.set_title(title)
             axis.set_xlabel("Forecast beat index")
-            axis.set_ylabel(f"RR interval {metric_name.upper()} (s)")
+            axis.set_ylabel(ylabel)
             axis.grid(True, alpha=0.25)
             axis.legend(fontsize=8, frameon=False)
             axis.spines["top"].set_visible(False)

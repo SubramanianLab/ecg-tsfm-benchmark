@@ -144,6 +144,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Figure-level label for the per-beat publication figure.",
     )
     parser.add_argument(
+        "--paper-step-metric-type",
+        type=str,
+        default="rr",
+        choices=["rr", "rr_variability", "waveform_rr_variability"],
+        help="Step-metric family to plot for the publication figure.",
+    )
+    parser.add_argument(
         "--paper-step-sampling-rate",
         type=float,
         default=128.0,
@@ -214,6 +221,7 @@ def run_cli(args: argparse.Namespace) -> None:
             output_path,
             contexts=_parse_int_list(args.paper_step_contexts),
             horizon=args.paper_step_horizon,
+            metric_type=args.paper_step_metric_type,
             cohort_label=args.paper_step_cohort_label,
             sampling_rate_hz=args.paper_step_sampling_rate,
         )

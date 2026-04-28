@@ -30,6 +30,10 @@ METRIC_FIELDNAMES = [
     "rr_mae",
     "rr_window_rmse_mean",
     "rr_window_mae_mean",
+    "rr_true_local_std_mean",
+    "rr_pred_local_std_mean",
+    "rr_local_std_ratio",
+    "rr_local_std_deficit",
     "rr_ks_mean",
     "rr_ks_cutoff_mean",
     "rr_ks_pass_rate",
@@ -37,6 +41,10 @@ METRIC_FIELDNAMES = [
     "waveform_rr_mae",
     "waveform_rr_window_rmse_mean",
     "waveform_rr_window_mae_mean",
+    "waveform_rr_true_local_std_mean",
+    "waveform_rr_pred_local_std_mean",
+    "waveform_rr_local_std_ratio",
+    "waveform_rr_local_std_deficit",
     "waveform_rr_ks_mean",
     "waveform_rr_ks_cutoff_mean",
     "waveform_rr_ks_pass_rate",
@@ -53,6 +61,14 @@ STEP_FIELDNAMES = [
     "step_index",
     "rmse",
     "mae",
+    "true_sdnn",
+    "pred_sdnn",
+    "sdnn_ratio",
+    "sdnn_deficit",
+    "true_rmssd",
+    "pred_rmssd",
+    "rmssd_ratio",
+    "rmssd_deficit",
     "count",
 ]
 
@@ -95,6 +111,7 @@ METRIC_KEY_FIELDS = [
 ]
 
 STEP_KEY_FIELDS = [
+    "metric_type",
     "model",
     "context_length",
     "horizon",
@@ -104,6 +121,7 @@ STEP_KEY_FIELDS = [
 ]
 
 SUM_FIELDS = {"num_windows", "num_series", "count"}
+LOCAL_STD_WINDOW_BEATS = 16
 
 
 def is_missing_value(value: Any) -> bool:
@@ -167,7 +185,7 @@ def _as_float(value: Any) -> float:
 def _row_key(row: Dict[str, Any], fields: Sequence[str]) -> tuple[Any, ...]:
     values = []
     for field in fields:
-        if field == "model":
+        if field in {"model", "metric_type"}:
             values.append(str(row[field]))
         else:
             values.append(_as_int(row[field]))
@@ -188,7 +206,16 @@ def _metric_row_has_ks(row: Dict[str, Any]) -> bool:
     return not (
         is_missing_value(row.get("rr_ks_mean"))
         or is_missing_value(row.get("waveform_rr_ks_mean"))
+        or is_missing_value(row.get("rr_local_std_ratio"))
+        or is_missing_value(row.get("waveform_rr_local_std_ratio"))
     )
+
+
+def _step_metric_types_by_key(rows: Sequence[Dict[str, Any]]) -> Dict[tuple[Any, ...], set[str]]:
+    output: Dict[tuple[Any, ...], set[str]] = {}
+    for row in rows:
+        output.setdefault(_row_key(row, METRIC_KEY_FIELDS), set()).add(str(row.get("metric_type", "")))
+    return output
 
 
 def _sort_metric_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -212,6 +239,7 @@ def _sort_step_rows(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
             str(row.get("subject_id", "")),
             _as_int(row["context_length"]),
             _as_int(row["horizon"]),
+            str(row.get("metric_type", "")),
             model_order.get(str(row["model"]), 999),
             _as_int(row["step_index"]),
         ),
@@ -234,7 +262,7 @@ def _average_subject_rows(
         for field, value in zip(key_fields, key):
             output[field] = value
         if "metric_type" in fieldnames:
-            output["metric_type"] = "rr"
+            output.setdefault("metric_type", "rr")
 
         for field in fieldnames:
             if field in output or field in key_fields:
@@ -481,6 +509,10 @@ def _empty_metric_dict() -> Dict[str, Any]:
         "mae": math.nan,
         "window_rmse_mean": math.nan,
         "window_mae_mean": math.nan,
+        "true_local_std_mean": math.nan,
+        "pred_local_std_mean": math.nan,
+        "local_std_ratio": math.nan,
+        "local_std_deficit": math.nan,
         "ks_mean": math.nan,
         "ks_cutoff_mean": math.nan,
         "ks_pass_rate": math.nan,
@@ -697,6 +729,8 @@ def aggregate_point_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> D
     errors = []
     window_rmse = []
     window_mae = []
+    true_local_stds = []
+    pred_local_stds = []
     for truth, pred in pairs:
         limit = min(len(truth), len(pred))
         if limit == 0:
@@ -707,21 +741,79 @@ def aggregate_point_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> D
         errors.append(diff)
         window_rmse.append(float(np.sqrt(np.mean(diff**2))))
         window_mae.append(float(np.mean(np.abs(diff))))
+        truth_std = local_std_values(truth_limited, LOCAL_STD_WINDOW_BEATS)
+        pred_std = local_std_values(pred_limited, LOCAL_STD_WINDOW_BEATS)
+        std_limit = min(len(truth_std), len(pred_std))
+        if std_limit:
+            true_local_stds.append(truth_std[:std_limit])
+            pred_local_stds.append(pred_std[:std_limit])
 
     output = _empty_metric_dict()
     if not errors:
         return output
 
     all_errors = np.concatenate(errors)
+    true_std_mean = math.nan
+    pred_std_mean = math.nan
+    if true_local_stds and pred_local_stds:
+        all_true_stds = np.concatenate(true_local_stds)
+        all_pred_stds = np.concatenate(pred_local_stds)
+        finite = np.isfinite(all_true_stds) & np.isfinite(all_pred_stds) & (all_true_stds > 0)
+        if finite.any():
+            true_std_mean = float(np.mean(all_true_stds[finite]))
+            pred_std_mean = float(np.mean(all_pred_stds[finite]))
     output.update(
         {
             "rmse": float(np.sqrt(np.mean(all_errors**2))),
             "mae": float(np.mean(np.abs(all_errors))),
             "window_rmse_mean": float(np.mean(window_rmse)),
             "window_mae_mean": float(np.mean(window_mae)),
+            "true_local_std_mean": true_std_mean,
+            "pred_local_std_mean": pred_std_mean,
+            "local_std_ratio": (
+                float(pred_std_mean / true_std_mean)
+                if np.isfinite(true_std_mean) and true_std_mean > 0 and np.isfinite(pred_std_mean)
+                else math.nan
+            ),
+            "local_std_deficit": (
+                float(true_std_mean - pred_std_mean)
+                if np.isfinite(true_std_mean) and np.isfinite(pred_std_mean)
+                else math.nan
+            ),
         }
     )
     return output
+
+
+def local_std_values(values: np.ndarray, window_beats: int) -> np.ndarray:
+    series = np.asarray(values, dtype=np.float64).reshape(-1)
+    series = series[np.isfinite(series)]
+    window = int(window_beats)
+    if window <= 1 or series.size < window:
+        return np.array([], dtype=np.float64)
+    return np.asarray(
+        [np.std(series[index : index + window], ddof=0) for index in range(series.size - window + 1)],
+        dtype=np.float64,
+    )
+
+
+def sdnn(values: np.ndarray) -> float:
+    series = np.asarray(values, dtype=np.float64).reshape(-1)
+    series = series[np.isfinite(series)]
+    if series.size < 2:
+        return math.nan
+    return float(np.std(series, ddof=0))
+
+
+def rmssd(values: np.ndarray) -> float:
+    series = np.asarray(values, dtype=np.float64).reshape(-1)
+    series = series[np.isfinite(series)]
+    if series.size < 2:
+        return math.nan
+    diffs = np.diff(series)
+    if diffs.size == 0:
+        return math.nan
+    return float(np.sqrt(np.mean(diffs**2)))
 
 
 def aggregate_pit_ks(pit_pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> Dict[str, Any]:
@@ -781,6 +873,78 @@ def step_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]], horizon: int) -
     return rows
 
 
+def variability_step_metrics(
+    pairs: Sequence[tuple[np.ndarray, np.ndarray]],
+    horizon: int,
+    *,
+    window_beats: int = LOCAL_STD_WINDOW_BEATS,
+) -> List[Dict[str, Any]]:
+    rows = []
+    max_start = max(0, int(horizon) - int(window_beats) + 1)
+    for start_index in range(max_start):
+        true_sdnn_values = []
+        pred_sdnn_values = []
+        true_rmssd_values = []
+        pred_rmssd_values = []
+        for truth, pred in pairs:
+            stop_index = start_index + int(window_beats)
+            if stop_index <= len(truth) and stop_index <= len(pred):
+                truth_window = np.asarray(truth[start_index:stop_index], dtype=np.float64)
+                pred_window = np.asarray(pred[start_index:stop_index], dtype=np.float64)
+                true_sdnn_values.append(sdnn(truth_window))
+                pred_sdnn_values.append(sdnn(pred_window))
+                true_rmssd_values.append(rmssd(truth_window))
+                pred_rmssd_values.append(rmssd(pred_window))
+
+        finite_sdnn = (
+            np.isfinite(true_sdnn_values)
+            & np.isfinite(pred_sdnn_values)
+            & (np.asarray(true_sdnn_values, dtype=np.float64) > 0)
+        )
+        finite_rmssd = (
+            np.isfinite(true_rmssd_values)
+            & np.isfinite(pred_rmssd_values)
+            & (np.asarray(true_rmssd_values, dtype=np.float64) > 0)
+        )
+        true_sdnn_mean = float(np.mean(np.asarray(true_sdnn_values)[finite_sdnn])) if finite_sdnn.any() else math.nan
+        pred_sdnn_mean = float(np.mean(np.asarray(pred_sdnn_values)[finite_sdnn])) if finite_sdnn.any() else math.nan
+        true_rmssd_mean = float(np.mean(np.asarray(true_rmssd_values)[finite_rmssd])) if finite_rmssd.any() else math.nan
+        pred_rmssd_mean = float(np.mean(np.asarray(pred_rmssd_values)[finite_rmssd])) if finite_rmssd.any() else math.nan
+        rows.append(
+            {
+                "step_index": int(start_index + int(window_beats) // 2),
+                "rmse": math.nan,
+                "mae": math.nan,
+                "true_sdnn": true_sdnn_mean,
+                "pred_sdnn": pred_sdnn_mean,
+                "sdnn_ratio": (
+                    float(pred_sdnn_mean / true_sdnn_mean)
+                    if np.isfinite(true_sdnn_mean) and true_sdnn_mean > 0 and np.isfinite(pred_sdnn_mean)
+                    else math.nan
+                ),
+                "sdnn_deficit": (
+                    float(true_sdnn_mean - pred_sdnn_mean)
+                    if np.isfinite(true_sdnn_mean) and np.isfinite(pred_sdnn_mean)
+                    else math.nan
+                ),
+                "true_rmssd": true_rmssd_mean,
+                "pred_rmssd": pred_rmssd_mean,
+                "rmssd_ratio": (
+                    float(pred_rmssd_mean / true_rmssd_mean)
+                    if np.isfinite(true_rmssd_mean) and true_rmssd_mean > 0 and np.isfinite(pred_rmssd_mean)
+                    else math.nan
+                ),
+                "rmssd_deficit": (
+                    float(true_rmssd_mean - pred_rmssd_mean)
+                    if np.isfinite(true_rmssd_mean) and np.isfinite(pred_rmssd_mean)
+                    else math.nan
+                ),
+                "count": int(max(finite_sdnn.sum(), finite_rmssd.sum())),
+            }
+        )
+    return rows
+
+
 def metric_row(
     *,
     model_name: str,
@@ -810,6 +974,10 @@ def metric_row(
         "rr_mae": direct_rr_metrics["mae"],
         "rr_window_rmse_mean": direct_rr_metrics["window_rmse_mean"],
         "rr_window_mae_mean": direct_rr_metrics["window_mae_mean"],
+        "rr_true_local_std_mean": direct_rr_metrics["true_local_std_mean"],
+        "rr_pred_local_std_mean": direct_rr_metrics["pred_local_std_mean"],
+        "rr_local_std_ratio": direct_rr_metrics["local_std_ratio"],
+        "rr_local_std_deficit": direct_rr_metrics["local_std_deficit"],
         "rr_ks_mean": direct_rr_metrics["ks_mean"],
         "rr_ks_cutoff_mean": direct_rr_metrics.get("ks_cutoff_mean", math.nan),
         "rr_ks_pass_rate": direct_rr_metrics.get("ks_pass_rate", math.nan),
@@ -817,6 +985,10 @@ def metric_row(
         "waveform_rr_mae": extracted_rr_metrics["mae"],
         "waveform_rr_window_rmse_mean": extracted_rr_metrics["window_rmse_mean"],
         "waveform_rr_window_mae_mean": extracted_rr_metrics["window_mae_mean"],
+        "waveform_rr_true_local_std_mean": extracted_rr_metrics["true_local_std_mean"],
+        "waveform_rr_pred_local_std_mean": extracted_rr_metrics["pred_local_std_mean"],
+        "waveform_rr_local_std_ratio": extracted_rr_metrics["local_std_ratio"],
+        "waveform_rr_local_std_deficit": extracted_rr_metrics["local_std_deficit"],
         "waveform_rr_ks_mean": extracted_rr_metrics["ks_mean"],
         "waveform_rr_ks_cutoff_mean": extracted_rr_metrics.get("ks_cutoff_mean", math.nan),
         "waveform_rr_ks_pass_rate": extracted_rr_metrics.get("ks_pass_rate", math.nan),
@@ -863,6 +1035,7 @@ def generate_paper_metrics(
 
         for horizon in horizons:
             missing_for_horizon = []
+            cached_step_types = _step_metric_types_by_key(subject_step_rows)
             for context_length in contexts:
                 current_rr_context = int(context_length) if rr_context is None else int(rr_context)
                 current_rr_horizon = int(horizon) if rr_horizon is None else int(rr_horizon)
@@ -880,7 +1053,9 @@ def generate_paper_metrics(
                         current_rr_context,
                         current_rr_horizon,
                     )
-                    if key not in cached_keys:
+                    step_types = cached_step_types.get(key, set())
+                    has_step_variability = {"rr", "rr_variability", "waveform_rr_variability"}.issubset(step_types)
+                    if key not in cached_keys or not has_step_variability:
                         missing_for_horizon.append(
                             (
                                 int(context_length),
@@ -982,6 +1157,34 @@ def generate_paper_metrics(
                             "subject_id": subject_id,
                             "sweep_type": "waveform_context",
                             "metric_type": "rr",
+                            "model": model_name,
+                            "context_length": context_length,
+                            "horizon": current_horizon,
+                            "rr_context_beats": int(current_rr_context),
+                            "rr_horizon_beats": int(current_rr_horizon),
+                            **step_row,
+                        }
+                    )
+                for step_row in variability_step_metrics(direct_pairs, current_rr_horizon):
+                    subject_step_rows.append(
+                        {
+                            "subject_id": subject_id,
+                            "sweep_type": "waveform_context",
+                            "metric_type": "rr_variability",
+                            "model": model_name,
+                            "context_length": context_length,
+                            "horizon": current_horizon,
+                            "rr_context_beats": int(current_rr_context),
+                            "rr_horizon_beats": int(current_rr_horizon),
+                            **step_row,
+                        }
+                    )
+                for step_row in variability_step_metrics(extracted_pairs, current_rr_horizon):
+                    subject_step_rows.append(
+                        {
+                            "subject_id": subject_id,
+                            "sweep_type": "waveform_context",
+                            "metric_type": "waveform_rr_variability",
                             "model": model_name,
                             "context_length": context_length,
                             "horizon": current_horizon,
