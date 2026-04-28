@@ -754,8 +754,6 @@ def merge_distribution_metrics(point_metrics: Dict[str, Any], ks_metrics: Dict[s
     output["ks_pass_rate"] = ks_metrics.get("ks_pass_rate", math.nan)
     return output
 
-
-# Backward-compatible alias. This no longer computes two-sample KS.
 def aggregate_metrics(pairs: Sequence[tuple[np.ndarray, np.ndarray]]) -> Dict[str, Any]:
     return aggregate_point_metrics(pairs)
 
