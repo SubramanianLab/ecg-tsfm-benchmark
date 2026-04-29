@@ -147,7 +147,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--paper-step-metric-type",
         type=str,
         default="rr",
-        choices=["rr", "rr_variability", "waveform_rr_variability"],
+        choices=["rr", "rr_variability", "waveform_rr_variability", "rr_combined"],
         help="Step-metric family to plot for the publication figure.",
     )
     parser.add_argument(

@@ -151,19 +151,114 @@ def plot_publication_rr_step_figure(
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    rows = load_evaluation_rows(step_csv_path)
+    if metric_type.lower() == "rr_combined":
+        if len(contexts) != 1:
+            raise ValueError("rr_combined figures require exactly one context.")
+        context_length = int(contexts[0])
+        filtered = [
+            row
+            for row in rows
+            if row.get("sweep_type") == "waveform_context"
+            and row.get("metric_type") in {"rr", "rr_variability"}
+            and int(row.get("context_length", -1)) == context_length
+            and (horizon is None or int(row.get("horizon", -1)) == int(horizon))
+        ]
+        if not filtered:
+            raise ValueError("No matching step-metric rows found for publication figure.")
+
+        by_type = {
+            metric_name: [row for row in filtered if row.get("metric_type") == metric_name]
+            for metric_name in ("rr", "rr_variability")
+        }
+        if not by_type["rr"] or not by_type["rr_variability"]:
+            present_types = sorted({str(row.get("metric_type", "")) for row in filtered})
+            raise ValueError(
+                "rr_combined figures require both rr and rr_variability rows. "
+                f"Found metric_type values: {', '.join(present_types) or 'none'}."
+            )
+
+        panels = [
+            ("rr", "rmse", "RMSE", "RR interval error (s)", "rmse"),
+            ("rr", "mae", "MAE", "RR interval error (s)", "mae"),
+            ("rr_variability", "sdnn", "Local SDNN", "RR variability (s)", "pred_sdnn"),
+            ("rr_variability", "rmssd", "Local RMSSD", "RR variability (s)", "pred_rmssd"),
+        ]
+        fig, axes = plt.subplots(2, 2, figsize=(12.5, 7.4), squeeze=False)
+        has_cohort_label = bool(cohort_label.strip())
+        if has_cohort_label:
+            fig.suptitle(cohort_label, fontsize=13, y=0.995)
+        for axis, (row_type, metric_name, title, ylabel, value_key) in zip(axes.ravel(), panels):
+            panel_rows = by_type[row_type]
+            if row_type == "rr_variability":
+                true_key = f"true_{metric_name}"
+                observed_by_step: Dict[int, List[float]] = {}
+                for row in panel_rows:
+                    value = row.get(true_key)
+                    if value is None or _is_missing_value(value):
+                        continue
+                    observed_by_step.setdefault(int(row["step_index"]), []).append(
+                        float(value) / float(sampling_rate_hz)
+                    )
+                observed_steps = sorted(observed_by_step)
+                if observed_steps:
+                    axis.plot(
+                        observed_steps,
+                        _rolling_median(
+                            [float(np.mean(observed_by_step[step])) for step in observed_steps]
+                        ),
+                        linewidth=1.8,
+                        color="black",
+                        linestyle="--",
+                        label="Observed",
+                    )
+
+            for model_name in MODEL_ORDER:
+                model_rows = sorted(
+                    [row for row in panel_rows if str(row["model"]) == model_name],
+                    key=lambda row: int(row["step_index"]),
+                )
+                if not model_rows:
+                    continue
+                axis.plot(
+                    [int(row["step_index"]) for row in model_rows],
+                    _rolling_median(
+                        [float(row[value_key]) / float(sampling_rate_hz) for row in model_rows]
+                    ),
+                    linewidth=1.7,
+                    color=MODEL_COLORS.get(model_name),
+                    label=model_name,
+                )
+            if row_type == "rr_variability":
+                axis.set_ylim(bottom=0)
+            axis.set_title(title)
+            axis.set_xlabel("Forecast beat index")
+            axis.set_ylabel(ylabel)
+            axis.grid(True, alpha=0.25)
+            axis.legend(fontsize=8, frameon=False)
+            axis.spines["top"].set_visible(False)
+            axis.spines["right"].set_visible(False)
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        plt.tight_layout(rect=(0, 0, 1, 0.96 if has_cohort_label else 1))
+        plt.savefig(output_path, dpi=180)
+        plt.close(fig)
+        print(f"Saved publication step figure to {output_path}")
+        return
+
     metric_label = {
         "rr": "RR Intervals",
         "rr_variability": "RR Variability",
         "waveform_rr_variability": "Waveform-Derived RR Variability",
     }.get(metric_type.lower(), metric_type)
     if metric_type.lower() in {"rr_variability", "waveform_rr_variability"}:
-        metric_names = ("sdnn_ratio", "rmssd_ratio")
+        metric_names = ("sdnn", "rmssd")
         metric_titles = {
-            "sdnn_ratio": "Local SDNN ratio",
-            "rmssd_ratio": "Local RMSSD ratio",
+            "sdnn": "Local SDNN",
+            "rmssd": "Local RMSSD",
         }
-        ylabel = "Predicted / true"
-        transform_value = lambda value: float(value)
+        ylabel = "RR variability (s)"
+        transform_value = lambda value: float(value) / float(sampling_rate_hz)
     else:
         metric_names = ("rmse", "mae")
         metric_titles = {
@@ -172,7 +267,6 @@ def plot_publication_rr_step_figure(
         }
         ylabel = "RR interval error (s)"
         transform_value = lambda value: float(value) / float(sampling_rate_hz)
-    rows = load_evaluation_rows(step_csv_path)
     filtered = [
         row
         for row in rows
@@ -198,6 +292,26 @@ def plot_publication_rr_step_figure(
         context_rows = [row for row in filtered if int(row["context_length"]) == context_length]
         for col_index, metric_name in enumerate(metric_names):
             axis = axes[row_index][col_index]
+            if metric_type.lower() in {"rr_variability", "waveform_rr_variability"}:
+                true_key = f"true_{metric_name}"
+                observed_by_step: Dict[int, List[float]] = {}
+                for row in context_rows:
+                    value = row.get(true_key)
+                    if value is None or _is_missing_value(value):
+                        continue
+                    observed_by_step.setdefault(int(row["step_index"]), []).append(transform_value(value))
+                observed_steps = sorted(observed_by_step)
+                if observed_steps:
+                    axis.plot(
+                        observed_steps,
+                        _rolling_median(
+                            [float(np.mean(observed_by_step[step])) for step in observed_steps]
+                        ),
+                        linewidth=1.8,
+                        color="black",
+                        linestyle="--",
+                        label="Observed",
+                    )
             for model_name in MODEL_ORDER:
                 model_rows = sorted(
                     [row for row in context_rows if str(row["model"]) == model_name],
@@ -205,17 +319,17 @@ def plot_publication_rr_step_figure(
                 )
                 if not model_rows:
                     continue
+                value_key = f"pred_{metric_name}" if metric_type.lower() in {"rr_variability", "waveform_rr_variability"} else metric_name
                 axis.plot(
                     [int(row["step_index"]) for row in model_rows],
                     _rolling_median(
-                        [transform_value(row[metric_name]) for row in model_rows]
+                        [transform_value(row[value_key]) for row in model_rows]
                     ),
                     linewidth=1.7,
                     color=MODEL_COLORS.get(model_name),
                     label=model_name,
                 )
             if metric_type.lower() in {"rr_variability", "waveform_rr_variability"}:
-                axis.axhline(1.0, color="0.35", linewidth=1.0, linestyle="--", alpha=0.75)
                 axis.set_ylim(bottom=0)
             title = metric_titles[metric_name]
             if len(ordered_contexts) > 1:
