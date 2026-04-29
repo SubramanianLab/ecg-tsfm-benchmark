@@ -54,7 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--moirai2-device",
         type=str,
-        default="cpu",
+        default="cuda",
         help="Torch device for Moirai 2.0. CPU is the default; use cuda explicitly with a small --moirai2-batch-size.",
     )
     parser.add_argument("--moirai2-batch-size", type=int, default=32)

@@ -210,7 +210,7 @@ def plot_publication_rr_step_figure(
                         linewidth=1.8,
                         color="black",
                         linestyle="--",
-                        label="Observed",
+                        label="Original Signal",
                     )
 
             for model_name in MODEL_ORDER:
